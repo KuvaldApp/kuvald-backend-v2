@@ -21,153 +21,217 @@ type ForgeRequestBody = {
 // ✅ HARD COST CONTROL
 const MODEL = "gpt-4o-mini";
 const OUTPUT_CAPS: Record<ForgeMode, number> = {
-  strike: 180,     // SPARK
-  guidance: 650,   // ANVIL
-  deep: 1200,      // FORGE
+  strike: 220,
+  guidance: 700,
+  deep: 1600,
 };
+
+// ✅ DEBUG / VERIFY WHICH PROMPT IS LIVE
+const PROMPT_VERSION = "kuvald-v3.2-brother-lock";
+
+// Keep this on while tuning. Turn off later.
+const RETURN_DEBUG = true;
+
+// One cheap auto-retry if the model breaks rules.
+const ENABLE_ONE_RETRY = true;
 
 function normalizeMode(mode: any): ForgeMode {
   if (mode === "guidance" || mode === "deep" || mode === "strike") return mode;
   return "strike";
 }
 
-function modeLabel(mode: ForgeMode) {
-  if (mode === "strike") return "SPARK";
-  if (mode === "guidance") return "ANVIL";
-  return "FORGE";
+function isGreeting(text: string) {
+  const t = (text ?? "").trim().toLowerCase();
+  return (
+    t === "hi" ||
+    t === "hey" ||
+    t === "hello" ||
+    t === "yo" ||
+    t === "sup" ||
+    t.startsWith("hi ") ||
+    t.startsWith("hey ") ||
+    t.startsWith("hello ") ||
+    t.startsWith("yo ") ||
+    t.startsWith("sup ")
+  );
 }
 
 /**
- * Removes markdown + “article formatting” so UI stays clean.
- * Keep it conservative (don’t over-strip content).
+ * Remove markdown-ish formatting + common “template” artifacts.
  */
-function cleanOutput(text: string) {
-  let t = (text ?? "").trim();
+function stripMarkdown(s: string) {
+  return (
+    s
+      .replace(/```[\s\S]*?```/g, "")
+      .replace(/`+/g, "")
+      .replace(/^#{1,6}\s+/gm, "")
+      .replace(/\*\*+/g, "")
+      .replace(/\*+/g, "")
+      .replace(/__+/g, "")
+      .replace(/_+/g, "")
+      .trim()
+  );
+}
 
-  // remove markdown headings/bullets/bold
-  t = t.replace(/^#{1,6}\s+/gm, "");
-  t = t.replace(/^\s*[-*•]\s+/gm, "");
-  t = t.replace(/\*\*(.*?)\*\*/g, "$1");
-  t = t.replace(/`{1,3}/g, "");
+/**
+ * HARD REMOVE any lines that start with forbidden labels.
+ * (Not just removing the word — nukes the whole line.)
+ */
+function removeForbiddenLabeledLines(s: string) {
+  return s
+    .split("\n")
+    .filter((line) => {
+      const l = line.trim().toLowerCase();
+      if (l.startsWith("action:")) return false;
+      if (l.startsWith("fallback:")) return false;
+      return true;
+    })
+    .join("\n")
+    .trim();
+}
 
-  // collapse excessive blank lines
-  t = t.replace(/\n{3,}/g, "\n\n");
+const FORBIDDEN_OUTPUT_SNIPPETS = [
+  "action:",
+  "fallback:",
+  "it’s common to feel overwhelmed",
+  "it's common to feel overwhelmed",
+  "choose one area that resonates with you",
+  "you got this king",
+  "you’ve got this king",
+];
 
-  // trim again
-  return t.trim();
+function containsForbidden(s: string) {
+  const t = (s ?? "").toLowerCase();
+  return FORBIDDEN_OUTPUT_SNIPPETS.some((x) => t.includes(x));
+}
+
+/**
+ * If the model response is too generic, we can nudge it.
+ * (Kept minimal; don't over-engineer.)
+ */
+function looksTooGeneric(s: string) {
+  const t = (s ?? "").toLowerCase();
+  // common dead responses we keep seeing
+  if (t.includes("log one small win") && t.includes("10-minute walk")) return true;
+  if (t.includes("what’s your focus today") && t.includes("body, mind, or finance")) return true;
+  return false;
 }
 
 function buildSystemPrompt(mode: ForgeMode) {
-  const label = modeLabel(mode);
-
   const modeRules =
     mode === "strike"
       ? `
-Mode: ${label} (fast directive)
-Output rules:
-- 1–5 short lines max
-- Blunt, decisive, practical
-- Use this structure:
-  One line opener
-  Action: ...
-  Fallback: ...
-- No explanations, no lists, no questions unless absolutely necessary
-`
+MODE: SPARK (strike)
+- Output 2–5 lines max.
+- No lists. No headings.
+- End with ONE: either a single next step OR a single question.
+- Be specific. No generic "go for a walk" unless user asked for body/movement.`
       : mode === "guidance"
       ? `
-Mode: ${label} (practical steps)
-Output rules:
-- 2–6 short paragraphs
-- 1–3 actions total
-- If user is vague: ask ONE sharp question, but still give an action now
-- Use plain text only (no markdown, no bold)
-`
+MODE: ANVIL (guidance)
+- Output 6–14 lines. Short paragraphs.
+- Give 2–4 concrete steps in normal speech (no numbered lists).
+- Ask ONE sharp question only if needed.
+- Include at least one “do this today” step.`
       : `
-Mode: ${label} (deep plan)
-Output rules:
-- Structured but tight (no markdown headings)
-- Diagnose in 2–4 lines
-- Plan in 3–6 steps max (plain text)
-- End with:
-  First move (today): ...
-  Fallback: ...
-`;
+MODE: FORGE (deep)
+- Output structured but plain text.
+- Allowed section titles: TODAY / THIS WEEK / RULES (plain text, no markdown).
+- Diagnose the pattern, give a plan, give examples.
+- End with ONE forcing-clarity question.`;
 
   return `
-You are KUVALD COACH inside THE FORGE.
+You are KUVALD — the coach inside THE FORGE.
 
-Voice:
-- masculine, calm authority
-- direct, “bro-like” in small doses (not cringe)
-- short sentences, no fluff
-- no therapy voice, no self-help article tone
+Identity:
+- Not a therapist. Not a cheerleader.
+- Grounded older brother energy: calm, direct, honest.
+- Masculine humor is allowed only when it lands. No cringe. No try-hard.
 
-Hard bans (never say these or anything similar):
-- "It's common to feel..."
-- "Consider doing..."
-- "You might want to..."
-- "As an AI..."
-- "Remember to..."
-- "It's important to..."
+Core job:
+- Turn vague intention into a concrete move.
+- Track patterns, not moods.
+- Respect effort. Confront avoidance.
+- Help the user build the man, not comfort the excuse.
 
-Behavior:
-- If the user is lost, choose for them. Don’t make them pick.
-- If the user asks big life questions, anchor to today. One move.
-- If streakDays is 0, say it plainly and reset them with a simple win.
-- If scores are low, call it out with a clear priority.
-- Always end with an executable action for today.
+TONE LOCK (non-negotiable):
+- Natural speech. Short paragraphs.
+- No corporate tone. No blog-post tone.
+- No generic motivational quotes.
+- Emojis: rare (max ONE), only for subtle humor.
 
-Formatting:
-- Plain text only.
-- No markdown headings, no bullet characters, no bold, no quotes.
-- You can use labels like "Action:" and "Fallback:".
+ABSOLUTE FORBIDDEN OUTPUT:
+- Never output these labels or anything like them:
+  "Action:", "Fallback:"
+- Never say:
+  "It’s common to feel overwhelmed"
+  "Choose one area that resonates with you"
+- Never talk like a Medium article.
 
-Personality micro-lines (use occasionally, not every message):
+Behavior rules:
+- If the user says "hi"/"hello" or is new:
+  Do a REAL welcome (3–6 lines). Explain what KUVALD is + what THE FORGE does.
+  Then ask ONE simple question to start.
+- If user is vague:
+  Ask ONE sharp question and still give ONE concrete move they can do today.
+- If user avoids action / repeats excuses:
+  Go dead serious. Call it out. No jokes.
+- If momentum exists:
+  Reinforce it. Say less. Tighten the plan.
+
+Style phrases you MAY use (sparingly):
 - "Alright."
 - "Listen."
+- "Hear me out."
 - "Here’s the move."
-- "Don’t overthink it."
-- "Start here."
+- "We’re not reinventing life today."
+
+IMPORTANT:
+- Output must be plain text.
+- Avoid bullet lists unless absolutely necessary.
+- If you accidentally use a forbidden label, you FAILED — rewrite without it before responding.
 
 ${modeRules}
 `.trim();
 }
 
 /**
- * Tiny few-shot examples to force the “KUVALD voice”
- * Keep short to control tokens/cost.
+ * A stricter emergency prompt used only on retry.
+ * (This is what stops mini from drifting into templates.)
  */
-function fewShotExamples(mode: ForgeMode) {
-  // Use same examples across modes, but they naturally compress in SPARK.
-  return [
-    {
-      role: "user" as const,
-      content: "Hi, what is this app about?",
-    },
-    {
-      role: "assistant" as const,
-      content:
-        "You’re in KUVALD.\nYou track habits across Body, Mind, Finance, Status.\nYou log the work. The scores tell the truth.\nAction: Pick one habit to do today.\nFallback: If you can’t pick, do a 10-minute walk now.",
-    },
-    {
-      role: "user" as const,
-      content: "I’m lost. I don’t know where to start.",
-    },
-    {
-      role: "assistant" as const,
-      content:
-        "Alright. We’re not building your whole life today.\nWe’re building momentum.\nAction: Body first. 10 minutes walk, no excuses.\nFallback: If you can’t walk, do 20 squats right now.",
-    },
-    {
-      role: "user" as const,
-      content: "What habits should I focus on to become a stronger man?",
-    },
-    {
-      role: "assistant" as const,
-      content:
-        "Good. Strength is built on boring consistency.\nAction: Body — train 30 minutes today or walk 30 minutes.\nAction: Mind — 10 pages reading or 15 minutes focused learning.\nAction: Finance — write down every expense today.\nFallback: If that’s too much, do only the Body action and log it.",
-    },
-  ];
+function buildRetrySystemPrompt(mode: ForgeMode) {
+  return `
+You are KUVALD. You must obey these constraints:
+
+- Output plain text only.
+- Do NOT output any line containing "Action:" or "Fallback:".
+- Do NOT output any list labels, templates, or coaching structures.
+- Speak like a grounded older brother. Short paragraphs.
+- Be specific to the user's last message.
+
+If the user greeted you, welcome them in 3–6 lines, explain THE FORGE, ask ONE question.
+
+If you break any rule, rewrite silently and output only the corrected answer.
+`.trim();
+}
+
+async function callForgeLLM(params: {
+  mode: ForgeMode;
+  max_output_tokens: number;
+  input: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+  temperature: number;
+}) {
+  const { mode, max_output_tokens, input, temperature } = params;
+
+  const response = await openai.responses.create({
+    model: MODEL,
+    input,
+    max_output_tokens,
+    temperature,
+  });
+
+  const raw = String((response as any).output_text ?? "").trim();
+  return raw;
 }
 
 export async function forgeHandler(req: Request, res: Response) {
@@ -189,37 +253,75 @@ export async function forgeHandler(req: Request, res: Response) {
       ? `Context: range=${range}, level=${level}, streakDays=${streakDays}, scores(total=${scores.total}, body=${scores.body}, mind=${scores.mind}, finance=${scores.finance}, status=${scores.status}).`
       : `Context: range=${range}, level=${level}, streakDays=${streakDays}.`;
 
-    // Strip daily-forge messages (client already filters, but keep backend safe)
-    const safeMessages = (body.messages ?? []).filter(Boolean);
+    const userLast =
+      [...(body.messages ?? [])].reverse().find((m) => m.role === "user")?.content ?? "";
+    const greeted = isGreeting(userLast);
 
+    // Force greeting behavior without making it “template-y”
+    const greetingDirective = greeted
+      ? `User greeting detected. Do first-contact onboarding now (3–6 lines). Then ask ONE question.`
+      : `No greeting. Respond normally.`;
+
+    // Build input (server owns system prompts)
     const input = [
       { role: "system" as const, content: buildSystemPrompt(mode) },
+      { role: "system" as const, content: `PROMPT_VERSION=${PROMPT_VERSION}` },
       { role: "system" as const, content: contextLine },
-
-      // few-shot “voice lock”
-      ...fewShotExamples(mode),
-
-      // actual conversation
-      ...safeMessages,
+      { role: "system" as const, content: greetingDirective },
+      ...(body.messages ?? []),
     ];
 
-    const response = await openai.responses.create({
-      model: MODEL,
-      input,
+    // First call
+    let raw = await callForgeLLM({
+      mode,
       max_output_tokens,
-      temperature: 0.65, // slightly lower = less “random generic coach”
-      // You can also add: top_p: 0.9 (optional, leave default unless needed)
+      input,
+      temperature: 0.65, // lower temp = less template drift
     });
 
-    const raw = (response as any).output_text ?? "";
-    const text = cleanOutput(raw);
+    let text = stripMarkdown(raw);
+    text = removeForbiddenLabeledLines(text);
 
-    return res.json({
+    // If it violates rules or looks like old “generic template”, retry once with stricter prompt.
+    if (ENABLE_ONE_RETRY && (containsForbidden(text) || looksTooGeneric(text))) {
+      const retryInput = [
+        { role: "system" as const, content: buildRetrySystemPrompt(mode) },
+        { role: "system" as const, content: `PROMPT_VERSION=${PROMPT_VERSION}` },
+        { role: "system" as const, content: contextLine },
+        { role: "system" as const, content: greetingDirective },
+        ...(body.messages ?? []),
+      ];
+
+      const retryRaw = await callForgeLLM({
+        mode,
+        max_output_tokens,
+        input: retryInput,
+        temperature: 0.55,
+      });
+
+      let retryText = stripMarkdown(retryRaw);
+      retryText = removeForbiddenLabeledLines(retryText);
+
+      // Use retry if it's better (i.e., less forbidden + less generic)
+      if (!containsForbidden(retryText)) text = retryText;
+    }
+
+    // Final hard guard: remove any remaining forbidden labels anywhere
+    text = text.replace(/\bAction:\s*/gi, "").replace(/\bFallback:\s*/gi, "").trim();
+
+    const payload: any = {
       text,
       mode,
       max_output_tokens,
       model: MODEL,
-    });
+    };
+
+    if (RETURN_DEBUG) {
+      payload.prompt_version = PROMPT_VERSION;
+      payload.server_time = new Date().toISOString();
+    }
+
+    return res.json(payload);
   } catch (err: any) {
     console.error(err);
     return res.status(500).json({
