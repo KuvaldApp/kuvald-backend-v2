@@ -1,6 +1,9 @@
 import OpenAI from "openai";
 import type { Request, Response } from "express";
 
+// ✅ NEW: App “brain/spec” injected into system prompt
+import { KUVALD_APP_SPEC } from "./kuvaldSpec";
+
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
@@ -221,7 +224,7 @@ async function callForgeLLM(params: {
   input: Array<{ role: "system" | "user" | "assistant"; content: string }>;
   temperature: number;
 }) {
-  const { mode, max_output_tokens, input, temperature } = params;
+  const { max_output_tokens, input, temperature } = params;
 
   const response = await openai.responses.create({
     model: MODEL,
@@ -262,8 +265,13 @@ export async function forgeHandler(req: Request, res: Response) {
       ? `User greeting detected. Do first-contact onboarding now (3–6 lines). Then ask ONE question.`
       : `No greeting. Respond normally.`;
 
+    // ✅ NEW: Inject the KUVALD app spec as the first system message
+    // This makes the model able to list habits, explain features, use the correct brand language, etc.
+    const kuvaldSpecSystem = { role: "system" as const, content: KUVALD_APP_SPEC };
+
     // Build input (server owns system prompts)
     const input = [
+      kuvaldSpecSystem,
       { role: "system" as const, content: buildSystemPrompt(mode) },
       { role: "system" as const, content: `PROMPT_VERSION=${PROMPT_VERSION}` },
       { role: "system" as const, content: contextLine },
@@ -285,6 +293,7 @@ export async function forgeHandler(req: Request, res: Response) {
     // If it violates rules or looks like old “generic template”, retry once with stricter prompt.
     if (ENABLE_ONE_RETRY && (containsForbidden(text) || looksTooGeneric(text))) {
       const retryInput = [
+        kuvaldSpecSystem,
         { role: "system" as const, content: buildRetrySystemPrompt(mode) },
         { role: "system" as const, content: `PROMPT_VERSION=${PROMPT_VERSION}` },
         { role: "system" as const, content: contextLine },
