@@ -95,6 +95,8 @@ function removeForbiddenLabeledLines(s: string) {
 
 const FORBIDDEN_OUTPUT_SNIPPETS = [
   "action:",
+  "i can’t provide a complete list",
+  "i can't provide a complete list",
   "fallback:",
   "it’s common to feel overwhelmed",
   "it's common to feel overwhelmed",
