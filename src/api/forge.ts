@@ -1,3 +1,4 @@
+// src/api/forge.ts
 import OpenAI from "openai";
 import type { Request, Response } from "express";
 
@@ -18,7 +19,7 @@ type ForgeRequestBody = {
     streakDays?: number;
     level?: number;
     range?: "today" | "7d" | "30d";
-    // (optional future) userTitle?: "king" | "queen" | "none";
+    // future: userTitle?: "king" | "queen" | "none";
   };
 };
 
@@ -30,11 +31,8 @@ const OUTPUT_CAPS: Record<ForgeMode, number> = {
   deep: 1600,
 };
 
-// ✅ DEBUG / VERIFY WHICH PROMPT IS LIVE
-const PROMPT_VERSION = "kuvald-v3.3-tone-escalation";
-
-// Keep this on while tuning. Turn off later.
-const RETURN_DEBUG = true;
+// ✅ Turn OFF debug fields by default (removes the “version lines” in chat UI)
+const RETURN_DEBUG = false;
 
 // One cheap auto-retry if the model breaks rules.
 const ENABLE_ONE_RETRY = true;
@@ -70,6 +68,7 @@ function wantsRuthless(text: string) {
     "be ruthless",
     "be brutal",
     "don't be soft",
+    "dont be soft",
     "stop babying me",
     "hit me",
     "tell me the truth",
@@ -77,6 +76,8 @@ function wantsRuthless(text: string) {
     "no bullshit",
     "no sugarcoat",
     "no sugar coat",
+    "be hard on me",
+    "be strict",
   ]);
 }
 
@@ -138,9 +139,6 @@ function containsForbidden(s: string) {
   return FORBIDDEN_OUTPUT_SNIPPETS.some((x) => t.includes(x));
 }
 
-/**
- * If the model response is too generic, we can nudge it.
- */
 function looksTooGeneric(s: string) {
   const t = (s ?? "").toLowerCase();
   if (t.includes("log one small win") && t.includes("10-minute walk")) return true;
@@ -148,13 +146,14 @@ function looksTooGeneric(s: string) {
   return false;
 }
 
-/**
- * We want fewer questions. This is a soft heuristic:
- * If the output contains multiple question marks, it's drifting.
- */
 function tooManyQuestions(s: string) {
   const matches = (s.match(/\?/g) ?? []).length;
   return matches >= 2;
+}
+
+function endsWithQuestion(s: string) {
+  const t = (s ?? "").trim();
+  return t.endsWith("?");
 }
 
 function buildSystemPrompt(mode: ForgeMode) {
@@ -164,22 +163,22 @@ function buildSystemPrompt(mode: ForgeMode) {
 MODE: SPARK (strike)
 - Output 2–5 lines max.
 - No lists. No headings.
-- Default: end with a DIRECTIVE (a commitment line), NOT a question.
-- A question is allowed only if absolutely necessary to proceed.`
+- Default: end with a DIRECTIVE (commitment line), NOT a question.
+- ONE question max only if absolutely required.`
       : mode === "guidance"
       ? `
 MODE: ANVIL (guidance)
 - Output 6–14 lines. Short paragraphs.
 - Give 2–4 concrete steps in normal speech (no numbered lists).
 - Default: end with a DIRECTIVE (what to do next).
-- ONE question max, only if needed.`
+- ONE question max only if needed.`
       : `
 MODE: FORGE (deep)
 - Output structured but plain text.
 - Allowed section titles: TODAY / THIS WEEK / RULES (plain text, no markdown).
 - Diagnose the pattern, give a plan, give examples.
 - Default: end with a DIRECTIVE (commitment), not a question.
-- ONE question max, only if it unlocks the plan.`;
+- ONE question max only if it unlocks the plan.`;
 
   return `
 You are KUVALD — the coach inside THE FORGE.
@@ -202,7 +201,7 @@ Level 3 — Ruthless (earned, controlled):
 HUMOR / REWARD (earned):
 - Humor is allowed but rare and situational. Dry, masculine edge. Not try-hard.
 - Earned praise is allowed (“Respect.” / “Good.” / “That’s discipline.”).
-- “King/queen/champ” allowed only when earned OR the user explicitly asks — and even then, make it conditional (“Earn it.”).
+- “King/queen/champ/legend” allowed only when earned OR the user explicitly asks — and even then, make it conditional (“Earn it.”).
 - Emojis: rare (max ONE) only for a punchline or emphasis.
 
 QUESTION POLICY (important):
@@ -215,7 +214,7 @@ Behavior rules:
   Do a REAL welcome (3–6 lines). Explain what KUVALD is + what THE FORGE does.
   Then ONE question max.
 - If user asks “What is KUVALD?” / “Why no reminders?” / “List habits?”:
-  Answer cleanly from spec first. Then end with a directive (or ONE short question if needed).
+  Answer cleanly from spec first. Then end with a directive.
 - If user is vague:
   Give ONE concrete move first. Optional ONE sharp question after.
 - If user avoids action / repeats excuses:
@@ -235,9 +234,6 @@ ${modeRules}
 `.trim();
 }
 
-/**
- * A stricter emergency prompt used only on retry.
- */
 function buildRetrySystemPrompt() {
   return `
 You are KUVALD. Obey these constraints:
@@ -304,18 +300,23 @@ export async function forgeHandler(req: Request, res: Response) {
       ? `User greeting detected. Do first-contact onboarding now (3–6 lines). ONE question max.`
       : `No greeting. Respond normally.`;
 
-    // If user explicitly asks for ruthless: escalate tone and DO NOT end with a question.
+    // ✅ Ruthless directive: quick intent read + immediate commitment (no question ending)
     const ruthlessDirective = ruthless
-      ? `User asked for ruthless. Use Tone Level 3 (earned, controlled). Start with a short read of WHY they want ruthless (1–2 lines, not therapy). Then give a concrete commitment. Do NOT end with a question.`
+      ? `User asked for ruthless. Use Tone Level 3 (earned, controlled).
+Start with a 1–2 line read of why they want ruthless (no therapy talk). Examples of valid reads:
+- "You want pressure because you’re tired of your own negotiation."
+- "You want a shove because comfort has been winning lately."
+Then deliver a hard mirror + a concrete commitment.
+Do NOT end with a question.`
       : `No special ruthlessness requested. Default tone rules apply.`;
 
     // ✅ Inject app spec first
     const kuvaldSpecSystem = { role: "system" as const, content: KUVALD_APP_SPEC };
 
-    const input = [
+    // ✅ Use explicit variable name (fixes the red "input," shorthand issue)
+    const inputMessages = [
       kuvaldSpecSystem,
       { role: "system" as const, content: buildSystemPrompt(mode) },
-      { role: "system" as const, content: `PROMPT_VERSION=${PROMPT_VERSION}` },
       { role: "system" as const, content: contextLine },
       { role: "system" as const, content: greetingDirective },
       { role: "system" as const, content: ruthlessDirective },
@@ -324,21 +325,23 @@ export async function forgeHandler(req: Request, res: Response) {
 
     let raw = await callForgeLLM({
       max_output_tokens,
-      input,
-      temperature: 0.6,
+      input: inputMessages,
+      temperature: ruthless ? 0.55 : 0.6,
     });
 
     let text = stripMarkdown(raw);
     text = removeForbiddenLabeledLines(text);
 
     const needsRetry =
-      containsForbidden(text) || looksTooGeneric(text) || tooManyQuestions(text) || (ruthless && text.includes("?"));
+      containsForbidden(text) ||
+      looksTooGeneric(text) ||
+      tooManyQuestions(text) ||
+      (ruthless && (text.includes("?") || endsWithQuestion(text)));
 
     if (ENABLE_ONE_RETRY && needsRetry) {
-      const retryInput = [
+      const retryInputMessages = [
         kuvaldSpecSystem,
         { role: "system" as const, content: buildRetrySystemPrompt() },
-        { role: "system" as const, content: `PROMPT_VERSION=${PROMPT_VERSION}` },
         { role: "system" as const, content: contextLine },
         { role: "system" as const, content: greetingDirective },
         { role: "system" as const, content: ruthlessDirective },
@@ -347,15 +350,18 @@ export async function forgeHandler(req: Request, res: Response) {
 
       const retryRaw = await callForgeLLM({
         max_output_tokens,
-        input: retryInput,
-        temperature: 0.5,
+        input: retryInputMessages,
+        temperature: ruthless ? 0.5 : 0.55,
       });
 
       let retryText = stripMarkdown(retryRaw);
       retryText = removeForbiddenLabeledLines(retryText);
 
-      // Prefer retry if it cleans violations
-      if (!containsForbidden(retryText) && !tooManyQuestions(retryText)) {
+      if (
+        !containsForbidden(retryText) &&
+        !tooManyQuestions(retryText) &&
+        !(ruthless && (retryText.includes("?") || endsWithQuestion(retryText)))
+      ) {
         text = retryText;
       }
     }
@@ -363,6 +369,7 @@ export async function forgeHandler(req: Request, res: Response) {
     // Final hard guard
     text = text.replace(/\bAction:\s*/gi, "").replace(/\bFallback:\s*/gi, "").trim();
 
+    // ✅ Minimal payload (prevents version lines in UI)
     const payload: any = {
       text,
       mode,
@@ -370,8 +377,8 @@ export async function forgeHandler(req: Request, res: Response) {
       model: MODEL,
     };
 
+    // (Optional) keep debug off; enable only if you really need it later
     if (RETURN_DEBUG) {
-      payload.prompt_version = PROMPT_VERSION;
       payload.server_time = new Date().toISOString();
     }
 
